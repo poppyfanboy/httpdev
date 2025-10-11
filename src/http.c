@@ -1,6 +1,6 @@
 #include <assert.h> // assert
 #include <string.h> // memset, memcpy
-#include <stdlib.h> // malloc, realloc, free
+#include <stdlib.h> // malloc, free
 
 #include "common.h"
 #include "string.c"
@@ -29,7 +29,11 @@ typedef enum {
 
 typedef struct {
     HttpReaderState state;
-    char *partial_data; isize partial_size;
+    struct {
+        char *data;
+        isize size;
+        isize capacity;
+    } partial;
 
     HttpRequestLine request_line;
     char *body; isize body_size;
@@ -40,19 +44,26 @@ typedef struct {
 HttpReader *http_reader_create() {
     HttpReader *reader = malloc(sizeof(HttpReader));
     memset(reader, 0, sizeof(HttpReader));
+
+    // Capacity corresponds to the largest request-line/header-line we will be able to handle.
+    reader->partial.data = malloc(4096);
+    reader->partial.size = 0;
+    reader->partial.capacity = 4096;
+
     return reader;
 }
 
 void http_reader_destroy(HttpReader *reader) {
-    if (reader->partial_data != NULL) {
-        free(reader->partial_data);
-    }
+    free(reader->partial.data);
+
     if (reader->request_line.data != NULL) {
         free(reader->request_line.data);
     }
+
     if (reader->body != NULL) {
         free(reader->body);
     }
+
     free(reader);
 }
 
@@ -151,13 +162,21 @@ bool http_read_request_line(HttpReader *reader, char const **begin, char const *
     char const *iter = *begin;
     bool newline_found = eat_line(&iter, end);
 
-    reader->partial_data = realloc(reader->partial_data, reader->partial_size + (iter - *begin));
-    memcpy(reader->partial_data + reader->partial_size, *begin, iter - *begin);
-    reader->partial_size += iter - *begin;
+    if (reader->partial.size + (iter - *begin) > reader->partial.capacity) {
+        reader->state = HTTP_READ_ERROR;
+        return false;
+    }
+    memcpy(reader->partial.data + reader->partial.size, *begin, iter - *begin);
+    reader->partial.size += iter - *begin;
 
     if (newline_found) {
-        char const *request_line_iter = reader->partial_data;
-        char const *request_line_end = reader->partial_data + reader->partial_size;
+        reader->request_line.data = malloc(reader->partial.size);
+        memcpy(reader->request_line.data, reader->partial.data, reader->partial.size);
+
+        char const *request_line_iter = reader->request_line.data;
+        char const *request_line_end = reader->request_line.data + reader->partial.size;
+
+        reader->partial.size = 0;
 
         char const *method_begin = request_line_iter;
         eat_word(&request_line_iter, request_line_end);
@@ -183,10 +202,6 @@ bool http_read_request_line(HttpReader *reader, char const **begin, char const *
             return false;
         }
 
-        reader->request_line.data = reader->partial_data;
-        reader->partial_data = NULL;
-        reader->partial_size = 0;
-
         *begin = iter;
         return true;
     }
@@ -199,13 +214,16 @@ bool http_read_header(HttpReader *reader, char const **begin, char const *end) {
     char const *iter = *begin;
     bool newline_found = eat_line(&iter, end);
 
-    reader->partial_data = realloc(reader->partial_data, reader->partial_size + (iter - *begin));
-    memcpy(reader->partial_data + reader->partial_size, *begin, iter - *begin);
-    reader->partial_size += iter - *begin;
+    if (reader->partial.size + (iter - *begin) > reader->partial.capacity) {
+        reader->state = HTTP_READ_ERROR;
+        return false;
+    }
+    memcpy(reader->partial.data + reader->partial.size, *begin, iter - *begin);
+    reader->partial.size += iter - *begin;
 
     if (newline_found) {
-        char const *header_line_iter = reader->partial_data;
-        char const *header_line_end = reader->partial_data + reader->partial_size;
+        char const *header_line_iter = reader->partial.data;
+        char const *header_line_end = reader->partial.data + reader->partial.size;
 
         char const *header_name_begin = header_line_iter;
         if (!eat_token(&header_line_iter, header_line_end)) {
@@ -224,9 +242,7 @@ bool http_read_header(HttpReader *reader, char const **begin, char const *end) {
         eat_newline(&header_line_iter, header_line_end);
         assert(header_line_iter == header_line_end);
 
-        free(reader->partial_data);
-        reader->partial_data = NULL;
-        reader->partial_size = 0;
+        reader->partial.size = 0;
 
         *begin = iter;
         return true;
@@ -258,7 +274,7 @@ isize http_reader_feed(HttpReader *reader, char const *data, isize data_size) {
         }
 
         if (reader->state == HTTP_READ_HEADER) {
-            if (reader->partial_size == 0 && eat_newline(&data_iter, data_end)) {
+            if (reader->partial.size == 0 && eat_newline(&data_iter, data_end)) {
                 // TODO: Actually parse Content-Length from headers.
                 if (reader->content_length > 0) {
                     reader->state = HTTP_READ_BODY;

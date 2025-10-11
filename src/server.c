@@ -172,13 +172,15 @@ int main(void) {
                 input.size -= bytes_read;
             }
 
-            if (!socket_error && http_reader_done(reader)) {
+            if (!socket_error && reader->state == HTTP_READ_FINISH) {
                 char *response = NULL;
                 isize response_size = 0;
 
                 if (string_equals(reader->request_line.uri, SV("/"))) {
                     response = http_response_file(SV("index.html"), &response_size);
-                } else {
+                }
+
+                if (response == NULL) {
                     response = http_response_404(&response_size);
                 }
 
