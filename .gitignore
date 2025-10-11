@@ -1,0 +1,9 @@
+# This ignores everything, including the folders.
+*
+
+# Un-ignore only the source code folders.
+!src/
+
+# Only keep the source code files.
+!*.c
+!*.h
