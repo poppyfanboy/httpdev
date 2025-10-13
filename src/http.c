@@ -39,6 +39,9 @@ typedef struct {
     char *body; isize body_size;
 
     isize content_length;
+
+    bool is_websocket;
+    String websocket_key;
 } HttpReader;
 
 HttpReader *http_reader_create() {
@@ -55,6 +58,7 @@ HttpReader *http_reader_create() {
 
 void http_reader_destroy(HttpReader *reader) {
     free(reader->partial.data);
+    string_destroy(&reader->websocket_key);
 
     if (reader->request_line.data != NULL) {
         free(reader->request_line.data);
@@ -120,6 +124,25 @@ bool eat_line(char const **begin, char const *end) {
         }
         if (end - iter >= 2 && iter[0] == '\r' && iter[1] == '\n') {
             iter += 2;
+            *begin = iter;
+            return true;
+        }
+
+        iter += 1;
+    }
+
+    *begin = iter;
+    return false;
+}
+
+bool eat_until_newline(char const **begin, char const *end) {
+    char const *iter = *begin;
+    while (iter < end) {
+        if (end - iter == 1 && iter[0] == '\r') {
+            *begin = iter;
+            return false;
+        }
+        if (end - iter >= 2 && iter[0] == '\r' && iter[1] == '\n') {
             *begin = iter;
             return true;
         }
@@ -236,8 +259,22 @@ bool http_read_header(HttpReader *reader, char const **begin, char const *end) {
         skip_whitespaces(&header_line_iter, header_line_end);
 
         char const *header_value_begin = header_line_iter;
-        eat_line(&header_line_iter, header_line_end);
+        eat_until_newline(&header_line_iter, header_line_end);
         StringView header_value = string_from_range(header_value_begin, header_line_iter);
+
+        if (
+            string_equals(header_name, SV("Upgrade")) &&
+            string_equals(header_value, SV("websocket"))
+        ) {
+            reader->is_websocket = true;
+        }
+
+        if (
+            string_equals(header_name, SV("Sec-WebSocket-Key")) &&
+            header_value.size > 0
+        ) {
+            reader->websocket_key = string_clone(header_value);
+        }
 
         eat_newline(&header_line_iter, header_line_end);
         assert(header_line_iter == header_line_end);
