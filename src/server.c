@@ -20,12 +20,139 @@ typedef enum {
     WEBSOCKET,
 } SocketProtocol;
 
+typedef enum {
+    DIRECTORY_NOTIFIER,
+    LISTEN_SOCKET,
+    CLIENT_SOCKET,
+} EventSourceKind;
+
 typedef struct {
+    HANDLE event;
+    HANDLE directory;
+    void *buffer;
+    DWORD buffer_size;
+    OVERLAPPED overlapped;
+} DirectoryNotifier;
+
+typedef struct {
+    HANDLE event;
+    SOCKET socket;
+} ListenSocket;
+
+typedef struct {
+    HANDLE event;
     SOCKET socket;
     SocketProtocol protocol;
     bool closed;
-    bool has_error;
-} Socket;
+} ClientSocket;
+
+typedef struct {
+    EventSourceKind kind;
+    union {
+        struct {
+            HANDLE event;
+        } generic;
+        DirectoryNotifier directory_notifier;
+        ListenSocket listen_socket;
+        ClientSocket client_socket;
+    } as;
+} EventSource;
+
+bool event_source_directory_notifier(WCHAR *directory_path, EventSource *event_source) {
+    event_source->kind = DIRECTORY_NOTIFIER;
+    DirectoryNotifier *directory_notifier = &event_source->as.directory_notifier;
+
+    // Use FILE_FLAG_OVERLAPPED, so that ReadDirectoryChangesW is non-blocking.
+    directory_notifier->directory = CreateFileW(
+        directory_path,
+        FILE_LIST_DIRECTORY,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+        NULL
+    );
+    if (directory_notifier->directory == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    // Some arbitrary large buffer size.
+    directory_notifier->buffer_size = 256 * 1024;
+    directory_notifier->buffer = malloc(directory_notifier->buffer_size);
+
+    directory_notifier->overlapped.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    directory_notifier->event = directory_notifier->overlapped.hEvent;
+    if (directory_notifier->event == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    BOOL directory_changes_result = ReadDirectoryChangesW(
+        directory_notifier->directory,
+        directory_notifier->buffer, directory_notifier->buffer_size,
+        TRUE,
+        FILE_NOTIFY_CHANGE_LAST_WRITE,
+        NULL,
+        &directory_notifier->overlapped,
+        NULL
+    );
+    if (directory_changes_result == 0) {
+        return false;
+    }
+
+    return true;
+}
+
+bool event_source_listen_socket(char const *port, EventSource *event_source) {
+    event_source->kind = LISTEN_SOCKET;
+    ListenSocket *listen_socket = &event_source->as.listen_socket;
+
+    struct addrinfo *address_info;
+    struct addrinfo address_info_hints = {
+        .ai_family = AF_INET,
+        .ai_socktype = SOCK_STREAM,
+        .ai_protocol = IPPROTO_TCP,
+        .ai_flags = AI_PASSIVE,
+    };
+    if (getaddrinfo(NULL, port, &address_info_hints, &address_info) != 0) {
+        return false;
+    }
+
+    listen_socket->socket = socket(
+        address_info->ai_family,
+        address_info->ai_socktype,
+        address_info->ai_protocol
+    );
+    if (bind(listen_socket->socket, address_info->ai_addr, (int)address_info->ai_addrlen) != 0) {
+        return 1;
+    }
+
+    listen(listen_socket->socket, SOMAXCONN);
+
+    listen_socket->event = WSACreateEvent();
+    if (listen_socket->event == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    WSAEventSelect(listen_socket->socket, listen_socket->event, FD_ACCEPT);
+
+    return true;
+}
+
+bool event_source_client_socket(SOCKET socket, EventSource *event_source) {
+    event_source->kind = CLIENT_SOCKET;
+    ClientSocket *client_socket = &event_source->as.client_socket;
+
+    client_socket->protocol = HTTP;
+    client_socket->socket = socket;
+    client_socket->closed = false;
+
+    client_socket->event = WSACreateEvent();
+    if (client_socket->event == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    WSAEventSelect(socket, client_socket->event, FD_READ | FD_CLOSE);
+
+    return true;
+}
 
 char *http_response_404(isize *response_size) {
     char response_data[] =
@@ -96,6 +223,30 @@ char *http_response_file(StringView file_name, isize *response_size) {
     return response;
 }
 
+char *http_response_string(StringView content, char const *mime_type, isize *response_size) {
+    char headers_format[] =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: %td\r\n"
+        "Content-Type: %s\r\n"
+        "\r\n";
+    isize headers_size = snprintf(
+        NULL, 0, headers_format,
+        /* Content-Length: */ content.size,
+        /* Content-Type: */ mime_type
+    );
+
+    char *response = malloc((headers_size + 1) + content.size);
+    snprintf(
+        response, headers_size + 1, headers_format,
+        /* Content-Length: */ content.size,
+        /* Content-Type: */ mime_type
+    );
+    memcpy(response + headers_size, content.data, content.size);
+
+    *response_size = headers_size + content.size;
+    return response;
+}
+
 bool socket_send_all(SOCKET socket, char const *data, isize data_size) {
     while (data_size > 0) {
         int bytes_sent = send(socket, data, data_size, 0);
@@ -110,45 +261,47 @@ bool socket_send_all(SOCKET socket, char const *data, isize data_size) {
     return true;
 }
 
-int main(void) {
+isize wide_string_length(WCHAR *string) {
+    WCHAR *string_iter = string;
+    while (*string_iter != L'\0') {
+        string_iter += 1;
+    }
+    return string_iter - string;
+}
+
+int wmain(int arg_count, WCHAR **args) {
     WSADATA wsa_data;
     if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
         return 1;
     }
 
-    struct addrinfo *address_info;
-    {
-        struct addrinfo address_info_hints = {
-            .ai_family = AF_INET,
-            .ai_socktype = SOCK_STREAM,
-            .ai_protocol = IPPROTO_TCP,
-            .ai_flags = AI_PASSIVE,
-        };
-        if (getaddrinfo(NULL, PORT, &address_info_hints, &address_info) != 0) {
-            return 1;
-        }
+    WCHAR *directory_path = L"./";
+    if (arg_count > 1) {
+        directory_path = args[1];
     }
 
-    SOCKET listen_socket = socket(
-        address_info->ai_family,
-        address_info->ai_socktype,
-        address_info->ai_protocol
-    );
-    if (bind(listen_socket, address_info->ai_addr, (int)address_info->ai_addrlen) != 0) {
+    struct {
+        EventSource *data;
+        isize count;
+        isize capacity;
+    } event_sources = {malloc(64 * sizeof(EventSource)), 0, 64};
+
+    bool directory_notifier_created =
+        event_source_directory_notifier(directory_path, &event_sources.data[event_sources.count]);
+    event_sources.count += 1;
+
+    bool listen_socket_created =
+        event_source_listen_socket(PORT, &event_sources.data[event_sources.count]);
+    event_sources.count += 1;
+
+    if (!directory_notifier_created || !listen_socket_created) {
         return 1;
     }
 
-    listen(listen_socket, SOMAXCONN);
-
-    Socket read_sockets[FD_SETSIZE] = {0};
-
-    isize read_socket_count = 1;
-    read_sockets[0] = (Socket){
-        .protocol = HTTP,
-        .socket = listen_socket,
-        .closed = false,
-        .has_error = false,
-    };
+    HANDLE *events = malloc(event_sources.capacity * sizeof(HANDLE));
+    for (isize i = 0; i < event_sources.count; i += 1) {
+        events[i] = event_sources.data[i].as.generic.event;
+    }
 
     struct {
         char *data;
@@ -157,81 +310,160 @@ int main(void) {
     } input = {malloc(IO_BUFFER_SIZE), 0, IO_BUFFER_SIZE};
 
     while (true) {
-        fd_set read_sockets_set, error_sockets_set;
-        FD_ZERO(&read_sockets_set);
-        FD_ZERO(&error_sockets_set);
-        for (isize i = 0; i < read_socket_count; i += 1) {
-            FD_SET(read_sockets[i].socket, &read_sockets_set);
-            FD_SET(read_sockets[i].socket, &error_sockets_set);
+        DWORD wait_result = WaitForMultipleObjects(event_sources.count, events, FALSE, INFINITE);
+        if (wait_result == WAIT_FAILED || wait_result == WAIT_TIMEOUT) {
+            return 1;
         }
-        select(0, &read_sockets_set, NULL, &error_sockets_set, NULL);
 
-        for (isize i = 0; i < read_socket_count; i += 1) {
-            if (read_sockets[i].socket == listen_socket) {
-                continue;
+        EventSource *event_source = &event_sources.data[wait_result - WAIT_OBJECT_0];
+
+        if (event_source->kind == LISTEN_SOCKET) {
+            ListenSocket *listen_socket = &event_source->as.listen_socket;
+
+            SOCKET socket = accept(listen_socket->socket, 0, 0);
+
+            EventSource client_socket;
+            if (!event_source_client_socket(socket, &client_socket)) {
+                return 1;
             }
 
-            Socket *client = &read_sockets[i];
-
-            if (!FD_ISSET(client->socket, &read_sockets_set)) {
-                continue;
-            }
-            if (FD_ISSET(client->socket, &error_sockets_set)) {
-                client->has_error = true;
-                client->closed = true;
-                closesocket(client->socket);
-                continue;
+            if (event_sources.count < event_sources.capacity) {
+                event_sources.data[event_sources.count] = client_socket;
+                events[event_sources.count] = client_socket.as.generic.event;
+                event_sources.count += 1;
+            } else {
+                closesocket(socket);
             }
 
-            if (client->protocol == WEBSOCKET) {
-                int bytes_received = recv(client->socket, input.data, input.capacity, 0);
+            WSAResetEvent(listen_socket->event);
+            continue;
+        }
+
+        if (event_source->kind == DIRECTORY_NOTIFIER) {
+            DirectoryNotifier *directory_notifier = &event_source->as.directory_notifier;
+
+            DWORD overlapped_bytes;
+            BOOL overlapped_result = GetOverlappedResult(
+                directory_notifier->directory,
+                &directory_notifier->overlapped,
+                &overlapped_bytes,
+                FALSE
+            );
+            if (overlapped_result == FALSE) {
+                return 1;
+            }
+
+            BOOL directory_changes_result = ReadDirectoryChangesW(
+                directory_notifier->directory,
+                directory_notifier->buffer, directory_notifier->buffer_size,
+                TRUE,
+                FILE_NOTIFY_CHANGE_LAST_WRITE,
+                NULL,
+                &directory_notifier->overlapped,
+                NULL
+            );
+            if (directory_changes_result == 0) {
+                return false;
+            }
+
+            FILE_NOTIFY_INFORMATION *notification = directory_notifier->buffer;
+            while (true) {
+                WCHAR path[MAX_PATH] = {0};
+                memcpy(path, notification->FileName, notification->FileNameLength);
+
+                DWORD path_attributes = GetFileAttributesW(path);
+                if (
+                    (path_attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 &&
+                    (notification->Action & FILE_ACTION_MODIFIED) != 0
+                ) {
+                    HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
+                    WriteConsoleW(console, L"File update: ", 14, NULL, NULL);
+                    WriteConsoleW(console, path, wide_string_length(path), NULL, NULL);
+                    WriteConsoleW(console, L"\n", 1, NULL, NULL);
+
+                    for (isize i = 0; i < event_sources.count; i += 1) {
+                        if (
+                            event_sources.data[i].kind == CLIENT_SOCKET &&
+                            event_sources.data[i].as.client_socket.protocol == WEBSOCKET
+                        ) {
+                            ClientSocket *client_socket = &event_sources.data[i].as.client_socket;
+                            assert(!client_socket->closed);
+                            // https://www.rfc-editor.org/rfc/rfc6455.html#section-5.7
+                            char message[] = {0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f};
+                            if (!socket_send_all(client_socket->socket, message, sizeof(message))) {
+                                client_socket->closed = true;
+                                closesocket(client_socket->socket);
+                            }
+                        }
+                    }
+                }
+
+                if (notification->NextEntryOffset == 0) {
+                    break;
+                }
+                notification = (void *)((char *)notification + notification->NextEntryOffset);
+            }
+
+            continue;
+        }
+
+        if (event_source->kind == CLIENT_SOCKET) {
+            ClientSocket *client_socket = &event_source->as.client_socket;
+
+            if (client_socket->protocol == WEBSOCKET) {
+                int bytes_received = recv(client_socket->socket, input.data, input.capacity, 0);
+
                 if (bytes_received == 0 || bytes_received == SOCKET_ERROR) {
-                    client->closed = true;
-                    closesocket(client->socket);
+                    int error = WSAGetLastError();
+
+                    // Ignore this error.
+                    if (error != WSAEWOULDBLOCK) {
+                        client_socket->closed = true;
+                        closesocket(client_socket->socket);
+                    }
                 }
 
                 // The client shall not speek to the server.
                 // (Even if you don't call websocket.send() explicitly from JavaScript it might
                 // still send a Close frame automatically which at least needs to be recv-ed.)
                 if (bytes_received > 0) {
-                    client->closed = true;
-                    closesocket(client->socket);
+                    client_socket->closed = true;
+                    closesocket(client_socket->socket);
                 }
-
-                continue;
             }
 
-            HttpReader *reader = http_reader_create();
-            input.size = 0;
+            if (client_socket->protocol == HTTP) {
+                HttpReader *reader = http_reader_create();
+                input.size = 0;
 
-            while (!http_reader_done(reader)) {
-                int bytes_received = recv(
-                    client->socket,
-                    input.data + input.size, input.capacity - input.size,
-                    0
-                );
-                if (bytes_received == 0) {
-                    break;
+                while (!http_reader_done(reader)) {
+                    int bytes_received = recv(
+                        client_socket->socket,
+                        input.data + input.size, input.capacity - input.size,
+                        0
+                    );
+                    if (bytes_received == 0) {
+                        if (reader->state != HTTP_READ_FINISH) {
+                            client_socket->closed = true;
+                            closesocket(client_socket->socket);
+                        }
+                        break;
+                    }
+                    if (bytes_received == SOCKET_ERROR) {
+                        client_socket->closed = true;
+                        closesocket(client_socket->socket);
+                        break;
+                    }
+
+                    input.size += bytes_received;
+                    isize bytes_read = http_reader_feed(reader, input.data, input.size);
+
+                    memmove(input.data, input.data + bytes_read, input.size - bytes_read);
+                    input.size -= bytes_read;
                 }
-                if (bytes_received == SOCKET_ERROR) {
-                    client->has_error = true;
-                    break;
-                }
 
-                input.size += bytes_received;
-                isize bytes_read = http_reader_feed(reader, input.data, input.size);
-
-                memmove(input.data, input.data + bytes_read, input.size - bytes_read);
-                input.size -= bytes_read;
-            }
-
-            if (client->has_error || reader->state != HTTP_READ_FINISH) {
-                client->closed = true;
-                closesocket(client->socket);
-            } else {
-                // https://www.rfc-editor.org/rfc/rfc6455.html#section-4.2.2
-                if (reader->is_websocket) {
-                    read_sockets[i].protocol = WEBSOCKET;
+                if (!client_socket->closed && reader->is_websocket) {
+                    client_socket->protocol = WEBSOCKET;
 
                     string_append(
                         &reader->websocket_key,
@@ -265,28 +497,46 @@ int main(void) {
                     char *response = malloc(response_size + 1);
                     snprintf(response, response_size + 1, response_format, accept_key);
 
-                    if (!socket_send_all(client->socket, response, response_size)) {
-                        client->has_error = true;
+                    if (!socket_send_all(client_socket->socket, response, response_size)) {
+                        client_socket->closed = true;
+                        closesocket(client_socket->socket);
                     }
 
                     free(accept_key);
                     free(response);
                 }
 
-                if (!reader->is_websocket) {
+                if (!client_socket->closed && !reader->is_websocket) {
                     char *response = NULL;
                     isize response_size = 0;
 
                     if (string_equals(reader->request_line.uri, SV("/"))) {
-                        response = http_response_file(SV("index.html"), &response_size);
+                        response = http_response_file(
+                            SV("index.html"),
+                            &response_size
+                        );
+                    }
+
+                    if (string_equals(reader->request_line.uri, SV("/hot-reload.js"))) {
+                        response = http_response_string(
+                            SV(
+                                "const socket = new WebSocket('ws://localhost:8080/');\n"
+                                "socket.addEventListener('message', (event) => {\n"
+                                "    location.reload();\n"
+                                "});"
+                            ),
+                            "application/javascript",
+                            &response_size
+                        );
                     }
 
                     if (response == NULL) {
                         response = http_response_404(&response_size);
                     }
 
-                    if (!socket_send_all(client->socket, response, response_size)) {
-                        client->has_error = true;
+                    if (!socket_send_all(client_socket->socket, response, response_size)) {
+                        client_socket->closed = true;
+                        closesocket(client_socket->socket);
                     }
                     free(response);
 
@@ -296,41 +546,27 @@ int main(void) {
                     // will detect a read update on this socket later). This still does not
                     // guarantee that the client will receive every single byte, but I don't know
                     // what else can I do.
-                    shutdown(client->socket, SD_SEND);
+                    shutdown(client_socket->socket, SD_SEND);
                 }
+
+                http_reader_destroy(reader);
             }
 
-            http_reader_destroy(reader);
-        }
+            if (client_socket->closed) {
+                isize removed_index = wait_result - WAIT_OBJECT_0;
 
-        Socket *socket_iter = read_sockets;
-        Socket *alive_socket_iter = read_sockets;
-        while (alive_socket_iter < read_sockets + read_socket_count) {
-            if (!alive_socket_iter->closed && !alive_socket_iter->has_error) {
-                *socket_iter = *alive_socket_iter;
-                socket_iter += 1;
-            }
-            alive_socket_iter += 1;
-        }
-        read_socket_count = socket_iter - read_sockets;
+                WSACloseEvent(events[removed_index]);
 
-        if (FD_ISSET(listen_socket, &read_sockets_set)) {
-            SOCKET client_socket = accept(listen_socket, 0, 0);
-
-            if (read_socket_count == FD_SETSIZE) {
-                closesocket(client_socket);
-                continue;
+                event_sources.data[removed_index] = event_sources.data[event_sources.count - 1];
+                events[removed_index] = events[event_sources.count - 1];
+                event_sources.count -= 1;
             }
 
-            Socket client = {
-                .socket = client_socket,
-                .protocol = HTTP,
-                .closed = false,
-                .has_error = false,
-            };
-            read_sockets[read_socket_count] = client;
-            read_socket_count += 1;
+            continue;
         }
+
+        assert(false);
+        return 1;
     }
 
     return 0;

@@ -44,7 +44,7 @@ typedef struct {
     String websocket_key;
 } HttpReader;
 
-HttpReader *http_reader_create() {
+HttpReader *http_reader_create(void) {
     HttpReader *reader = malloc(sizeof(HttpReader));
     memset(reader, 0, sizeof(HttpReader));
 
