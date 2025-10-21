@@ -81,7 +81,7 @@ bool event_source_directory_notifier(WCHAR *directory_path, EventSource *event_s
     directory_notifier->buffer_size = 256 * 1024;
     directory_notifier->buffer = malloc(directory_notifier->buffer_size);
 
-    directory_notifier->overlapped.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    directory_notifier->overlapped.hEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
     directory_notifier->event = directory_notifier->overlapped.hEvent;
 
     BOOL directory_changes_result = ReadDirectoryChangesW(
@@ -120,13 +120,17 @@ bool event_source_listen_socket(char const *port, EventSource *event_source) {
         address_info->ai_socktype,
         address_info->ai_protocol
     );
+
+    u_long make_non_blocking = 1;
+    ioctlsocket(listen_socket->socket, FIONBIO, &make_non_blocking);
+
     if (bind(listen_socket->socket, address_info->ai_addr, (int)address_info->ai_addrlen) != 0) {
         return false;
     }
 
     listen(listen_socket->socket, SOMAXCONN);
 
-    listen_socket->event = WSACreateEvent();
+    listen_socket->event = CreateEventW(NULL, FALSE, FALSE, NULL);
     WSAEventSelect(listen_socket->socket, listen_socket->event, FD_ACCEPT);
 
     return true;
@@ -140,7 +144,7 @@ bool event_source_client_socket(SOCKET socket, EventSource *event_source) {
     client_socket->socket = socket;
     client_socket->closed = false;
 
-    client_socket->event = WSACreateEvent();
+    client_socket->event = CreateEventW(NULL, FALSE, FALSE, NULL);
     WSAEventSelect(socket, client_socket->event, FD_READ | FD_CLOSE);
 
     return true;
@@ -299,23 +303,32 @@ int wmain(int arg_count, WCHAR **args) {
         if (event_source->kind == LISTEN_SOCKET) {
             ListenSocket *listen_socket = &event_source->as.listen_socket;
 
-            SOCKET socket = accept(listen_socket->socket, 0, 0);
+            while (true) {
+                SOCKET socket = accept(listen_socket->socket, 0, 0);
+                if (socket == SOCKET_ERROR) {
+                    if (WSAGetLastError() == WSAEWOULDBLOCK) {
+                        break;
+                    } else {
+                        return 1;
+                    }
+                }
 
-            EventSource client_socket;
-            if (!event_source_client_socket(socket, &client_socket)) {
-                return 1;
+                EventSource client_socket;
+                if (!event_source_client_socket(socket, &client_socket)) {
+                    return 1;
+                }
+
+                if (event_sources.count < event_sources.capacity) {
+                    event_sources.data[event_sources.count] = client_socket;
+                    events[event_sources.count] = client_socket.as.generic.event;
+                    event_sources.count += 1;
+                } else {
+                    CloseHandle(client_socket.as.client_socket.event);
+                    closesocket(socket);
+                    break;
+                }
             }
 
-            if (event_sources.count < event_sources.capacity) {
-                event_sources.data[event_sources.count] = client_socket;
-                events[event_sources.count] = client_socket.as.generic.event;
-                event_sources.count += 1;
-            } else {
-                WSACloseEvent(client_socket.as.client_socket.event);
-                closesocket(socket);
-            }
-
-            WSAResetEvent(listen_socket->event);
             continue;
         }
 
@@ -333,7 +346,6 @@ int wmain(int arg_count, WCHAR **args) {
                 return 1;
             }
 
-            ResetEvent(directory_notifier->event);
             BOOL directory_changes_result = ReadDirectoryChangesW(
                 directory_notifier->directory,
                 directory_notifier->buffer, directory_notifier->buffer_size,
@@ -536,13 +548,11 @@ int wmain(int arg_count, WCHAR **args) {
             if (client_socket->closed) {
                 isize removed_index = wait_result - WAIT_OBJECT_0;
 
-                WSACloseEvent(events[removed_index]);
+                CloseHandle(events[removed_index]);
 
                 event_sources.data[removed_index] = event_sources.data[event_sources.count - 1];
                 events[removed_index] = events[event_sources.count - 1];
                 event_sources.count -= 1;
-            } else {
-                WSAResetEvent(client_socket->event);
             }
 
             continue;
