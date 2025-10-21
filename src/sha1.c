@@ -1,8 +1,10 @@
+#include <assert.h> // assert
 #include <string.h> // memset
 
 #include "common.h"
 
 u32 u32_rotate_left(u32 value, int amount) {
+    assert(amount > 0);
     return value << amount | value >> (32 - amount);
 }
 
@@ -20,7 +22,7 @@ void sha1_process_block(u32 words[80], u32 h[5]) {
     u32 d = h[3];
     u32 e = h[4];
 
-    for (int t = 0; t < 20; t += 1) {
+    for (isize t = 0; t < 20; t += 1) {
         u32 f = b & c | ~b & d;
         u32 k = 0x5a827999;
         u32 temp = u32_rotate_left(a, 5) + f + e + words[t] + k;
@@ -31,7 +33,7 @@ void sha1_process_block(u32 words[80], u32 h[5]) {
         a = temp;
     }
 
-    for (int t = 20; t < 40; t += 1) {
+    for (isize t = 20; t < 40; t += 1) {
         u32 f = b ^ c ^ d;
         u32 k = 0x6ed9eba1;
         u32 temp = u32_rotate_left(a, 5) + f + e + words[t] + k;
@@ -42,7 +44,7 @@ void sha1_process_block(u32 words[80], u32 h[5]) {
         a = temp;
     }
 
-    for (int t = 40; t < 60; t += 1) {
+    for (isize t = 40; t < 60; t += 1) {
         u32 f = b & c | b & d | c & d;
         u32 k = 0x8f1bbcdc;
         u32 temp = u32_rotate_left(a, 5) + f + e + words[t] + k;
@@ -53,7 +55,7 @@ void sha1_process_block(u32 words[80], u32 h[5]) {
         a = temp;
     }
 
-    for (int t = 60; t < 80; t += 1) {
+    for (isize t = 60; t < 80; t += 1) {
         u32 f = b ^ c ^ d;
         u32 k = 0xca62c1d6;
         u32 temp = u32_rotate_left(a, 5) + f + e + words[t] + k;

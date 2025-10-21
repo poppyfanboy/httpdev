@@ -5,7 +5,7 @@
 
 #include <string.h> // memcpy, memmove
 #include <stdlib.h> // malloc, free
-#include <stdio.h>  // snprintf, fopen, fread, fclose, fseek, ftell
+#include <stdio.h>  // fopen, fread, fclose, fseek, ftell
 
 #define PORT "8080"
 #define IO_BUFFER_SIZE 4096
@@ -52,6 +52,7 @@ typedef struct {
         struct {
             HANDLE event;
         } generic;
+
         DirectoryNotifier directory_notifier;
         ListenSocket listen_socket;
         ClientSocket client_socket;
@@ -76,15 +77,12 @@ bool event_source_directory_notifier(WCHAR *directory_path, EventSource *event_s
         return false;
     }
 
-    // Some arbitrary large buffer size.
+    // Some arbitrarily large buffer size.
     directory_notifier->buffer_size = 256 * 1024;
     directory_notifier->buffer = malloc(directory_notifier->buffer_size);
 
     directory_notifier->overlapped.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
     directory_notifier->event = directory_notifier->overlapped.hEvent;
-    if (directory_notifier->event == INVALID_HANDLE_VALUE) {
-        return false;
-    }
 
     BOOL directory_changes_result = ReadDirectoryChangesW(
         directory_notifier->directory,
@@ -95,7 +93,7 @@ bool event_source_directory_notifier(WCHAR *directory_path, EventSource *event_s
         &directory_notifier->overlapped,
         NULL
     );
-    if (directory_changes_result == 0) {
+    if (directory_changes_result == FALSE) {
         return false;
     }
 
@@ -123,15 +121,12 @@ bool event_source_listen_socket(char const *port, EventSource *event_source) {
         address_info->ai_protocol
     );
     if (bind(listen_socket->socket, address_info->ai_addr, (int)address_info->ai_addrlen) != 0) {
-        return 1;
+        return false;
     }
 
     listen(listen_socket->socket, SOMAXCONN);
 
     listen_socket->event = WSACreateEvent();
-    if (listen_socket->event == INVALID_HANDLE_VALUE) {
-        return false;
-    }
     WSAEventSelect(listen_socket->socket, listen_socket->event, FD_ACCEPT);
 
     return true;
@@ -146,31 +141,22 @@ bool event_source_client_socket(SOCKET socket, EventSource *event_source) {
     client_socket->closed = false;
 
     client_socket->event = WSACreateEvent();
-    if (client_socket->event == INVALID_HANDLE_VALUE) {
-        return false;
-    }
     WSAEventSelect(socket, client_socket->event, FD_READ | FD_CLOSE);
 
     return true;
 }
 
-char *http_response_404(isize *response_size) {
+String http_response_404(void) {
     char response_data[] =
         "HTTP/1.1 404 Not Found\r\n"
         "Content-Length: 0\r\n\r\n";
-
-    // Allocate so that we could call free() on the return value.
-    char *response = malloc(lengthof(response_data));
-    memcpy(response, response_data, lengthof(response_data));
-
-    *response_size = lengthof(response_data);
-    return response;
+    return string_clone(SV(response_data));
 }
 
-char *http_response_file(StringView file_name, isize *response_size) {
+String http_response_file(StringView file_name) {
     FILE *file = fopen(file_name.data, "rb");
     if (file == NULL) {
-        return http_response_404(response_size);
+        return http_response_404();
     }
 
     fseek(file, 0, SEEK_END);
@@ -186,76 +172,69 @@ char *http_response_file(StringView file_name, isize *response_size) {
         mime_type = "application/javascript";
     }
 
+    String response = {0};
+    string_reserve(&response, 256 + file_size);
+
     char headers_format[] =
         "HTTP/1.1 200 OK\r\n"
         "Content-Length: %td\r\n"
         "Content-Type: %s\r\n"
         "\r\n";
-
-    isize headers_size = snprintf(
-        NULL, 0, headers_format,
+    string_append_format(
+        &response, headers_format,
         /* Content-Length: */ file_size,
         /* Content-Type: */ mime_type
     );
 
-    char *response = malloc((headers_size + 1) + file_size);
-    snprintf(
-        response, headers_size + 1, headers_format,
-        /* Content-Length: */ file_size,
-        /* Content-Type: */ mime_type
-    );
+    // TODO: Stream file responses instead of first reading entire files into memory.
 
-    char *response_iter = response + headers_size;
-    char *response_end = response + headers_size + file_size;
+    string_reserve(&response, response.size + file_size);
+    while (true) {
+        isize bytes_read = fread(
+            response.data + response.size,
+            1, response.capacity - response.size,
+            file
+        );
 
-    // TODO: Stream file responses instead of reading entire files into memory first.
-    while (response_iter < response_end) {
-        isize bytes_read = fread(response_iter, 1, response_end - response_iter, file);
-        if (bytes_read == 0) {
+        if (bytes_read > 0) {
+            response.size += bytes_read;
+        } else {
             break;
         }
-
-        response_iter += bytes_read;
     }
     fclose(file);
 
-    *response_size = response_iter - response;
     return response;
 }
 
-char *http_response_string(StringView content, char const *mime_type, isize *response_size) {
+String http_response_string(StringView content, char const *mime_type) {
+    String response = {0};
+    string_reserve(&response, 256 + content.size);
+
     char headers_format[] =
         "HTTP/1.1 200 OK\r\n"
         "Content-Length: %td\r\n"
         "Content-Type: %s\r\n"
         "\r\n";
-    isize headers_size = snprintf(
-        NULL, 0, headers_format,
+    string_append_format(
+        &response, headers_format,
         /* Content-Length: */ content.size,
         /* Content-Type: */ mime_type
     );
+    string_append(&response, content);
 
-    char *response = malloc((headers_size + 1) + content.size);
-    snprintf(
-        response, headers_size + 1, headers_format,
-        /* Content-Length: */ content.size,
-        /* Content-Type: */ mime_type
-    );
-    memcpy(response + headers_size, content.data, content.size);
-
-    *response_size = headers_size + content.size;
     return response;
 }
 
-bool socket_send_all(SOCKET socket, char const *data, isize data_size) {
-    while (data_size > 0) {
-        int bytes_sent = send(socket, data, data_size, 0);
+bool socket_send_all(SOCKET socket, StringView response) {
+    while (response.size > 0) {
+        int bytes_sent = send(socket, response.data, response.size, 0);
         if (bytes_sent == 0 || bytes_sent == SOCKET_ERROR) {
             return false;
         }
 
-        data += bytes_sent;
-        data_size -= bytes_sent;
+        response.data += bytes_sent;
+        response.size -= bytes_sent;
     }
 
     return true;
@@ -332,6 +311,7 @@ int wmain(int arg_count, WCHAR **args) {
                 events[event_sources.count] = client_socket.as.generic.event;
                 event_sources.count += 1;
             } else {
+                WSACloseEvent(client_socket.as.client_socket.event);
                 closesocket(socket);
             }
 
@@ -353,6 +333,7 @@ int wmain(int arg_count, WCHAR **args) {
                 return 1;
             }
 
+            ResetEvent(directory_notifier->event);
             BOOL directory_changes_result = ReadDirectoryChangesW(
                 directory_notifier->directory,
                 directory_notifier->buffer, directory_notifier->buffer_size,
@@ -382,18 +363,17 @@ int wmain(int arg_count, WCHAR **args) {
                     WriteConsoleW(console, L"\n", 1, NULL, NULL);
 
                     for (isize i = 0; i < event_sources.count; i += 1) {
-                        if (
-                            event_sources.data[i].kind == CLIENT_SOCKET &&
-                            event_sources.data[i].as.client_socket.protocol == WEBSOCKET
-                        ) {
-                            ClientSocket *client_socket = &event_sources.data[i].as.client_socket;
-                            assert(!client_socket->closed);
+                        if (event_sources.data[i].kind != CLIENT_SOCKET) {
+                            continue;
+                        }
+                        ClientSocket *client_socket = &event_sources.data[i].as.client_socket;
+
+                        if (client_socket->protocol == WEBSOCKET && !client_socket->closed) {
                             // https://www.rfc-editor.org/rfc/rfc6455.html#section-5.7
-                            char message[] = {0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f};
-                            if (!socket_send_all(client_socket->socket, message, sizeof(message))) {
-                                client_socket->closed = true;
-                                closesocket(client_socket->socket);
-                            }
+                            char message_data[] = {0x81, 0x05, 0x48, 0x65, 0x6c, 0x6c, 0x6f};
+
+                            StringView message = {message_data, sizeof(message_data)};
+                            socket_send_all(client_socket->socket, message);
                         }
                     }
                 }
@@ -432,7 +412,7 @@ int wmain(int arg_count, WCHAR **args) {
                 }
             }
 
-            if (client_socket->protocol == HTTP) {
+            if (!client_socket->closed && client_socket->protocol == HTTP) {
                 HttpReader *reader = http_reader_create();
                 input.size = 0;
 
@@ -493,52 +473,53 @@ int wmain(int arg_count, WCHAR **args) {
                         "Connection: Upgrade\r\n"
                         "Sec-WebSocket-Accept: %s\r\n"
                         "\r\n";
-                    isize response_size = snprintf(NULL, 0, response_format, accept_key);
-                    char *response = malloc(response_size + 1);
-                    snprintf(response, response_size + 1, response_format, accept_key);
+                    String response = {0};
+                    string_append_format(&response, response_format, accept_key);
 
-                    if (!socket_send_all(client_socket->socket, response, response_size)) {
+                    if (!socket_send_all(client_socket->socket, string_view(&response))) {
                         client_socket->closed = true;
                         closesocket(client_socket->socket);
                     }
 
+                    string_destroy(&response);
                     free(accept_key);
-                    free(response);
                 }
 
                 if (!client_socket->closed && !reader->is_websocket) {
-                    char *response = NULL;
+                    String response = string_empty();
                     isize response_size = 0;
 
                     if (string_equals(reader->request_line.uri, SV("/"))) {
-                        response = http_response_file(
-                            SV("index.html"),
-                            &response_size
-                        );
+                        response = http_response_file(SV("index.html"));
                     }
 
                     if (string_equals(reader->request_line.uri, SV("/hot-reload.js"))) {
-                        response = http_response_string(
-                            SV(
-                                "const socket = new WebSocket('ws://localhost:8080/');\n"
-                                "socket.addEventListener('message', (event) => {\n"
-                                "    location.reload();\n"
-                                "});"
-                            ),
-                            "application/javascript",
-                            &response_size
+                        char const code_format[] = SRC(
+                            const socket = new WebSocket("ws://localhost:%s/");
+                            socket.addEventListener("message", (event) => {
+                                location.reload();
+                            });
                         );
+                        String code = {0};
+                        string_append_format(&code, code_format, PORT);
+
+                        response = http_response_string(
+                            string_view(&code),
+                            "application/javascript"
+                        );
+
+                        string_destroy(&code);
                     }
 
-                    if (response == NULL) {
-                        response = http_response_404(&response_size);
+                    if (response.size == 0) {
+                        response = http_response_404();
                     }
 
-                    if (!socket_send_all(client_socket->socket, response, response_size)) {
+                    if (!socket_send_all(client_socket->socket, string_view(&response))) {
                         client_socket->closed = true;
                         closesocket(client_socket->socket);
                     }
-                    free(response);
+                    string_destroy(&response);
 
                     // https://blog.netherlabs.nl/articles/2009/01/18/the-ultimate-so_linger-page-or-why-is-my-tcp-not-reliable
                     //
@@ -560,6 +541,8 @@ int wmain(int arg_count, WCHAR **args) {
                 event_sources.data[removed_index] = event_sources.data[event_sources.count - 1];
                 events[removed_index] = events[event_sources.count - 1];
                 event_sources.count -= 1;
+            } else {
+                WSAResetEvent(client_socket->event);
             }
 
             continue;
