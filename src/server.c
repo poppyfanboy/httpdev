@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <shlwapi.h>
 
 #include <string.h> // memcpy, memmove
 #include <stdlib.h> // malloc, free
@@ -31,6 +32,7 @@ typedef enum {
 typedef struct {
     HANDLE event;
     HANDLE directory;
+    WCHAR *directory_path;
     void *buffer;
     DWORD buffer_size;
     OVERLAPPED overlapped;
@@ -77,6 +79,7 @@ bool event_source_directory_notifier(WCHAR *directory_path, EventSource *event_s
     if (directory_notifier->directory == INVALID_HANDLE_VALUE) {
         return false;
     }
+    directory_notifier->directory_path = directory_path;
 
     // Some arbitrarily large buffer size.
     directory_notifier->buffer_size = 256 * 1024;
@@ -129,10 +132,14 @@ bool directory_files_changed(DirectoryNotifier *directory_notifier) {
     FILE_NOTIFY_INFORMATION *notification = directory_notifier->buffer;
     while (true) {
         // Make sure the file name is null-terminated.
-        WCHAR path[MAX_PATH] = {0};
-        memcpy(path, notification->FileName, notification->FileNameLength);
+        WCHAR file_relative_path[MAX_PATH] = {0};
+        memcpy(file_relative_path, notification->FileName, notification->FileNameLength);
 
-        bool path_is_file = (GetFileAttributesW(path) & FILE_ATTRIBUTE_DIRECTORY) == 0;
+        // FIXME: Do something else to avoid depending on "shlwapi.dll".
+        WCHAR file_path[MAX_PATH];
+        PathCombineW(file_path, directory_notifier->directory_path, file_relative_path);
+
+        bool path_is_file = (GetFileAttributesW(file_path) & FILE_ATTRIBUTE_DIRECTORY) == 0;
         if (path_is_file && (notification->Action & FILE_ACTION_MODIFIED) != 0) {
             return true;
         }
@@ -224,6 +231,8 @@ String http_response_file(StringView file_name) {
         mime_type = "application/wasm";
     } else if (string_ends_with(file_name, SV(".js"))) {
         mime_type = "application/javascript";
+    } else if (string_ends_with(file_name, SV(".css"))) {
+        mime_type = "text/css";
     }
 
     String response = {0};
@@ -300,6 +309,8 @@ typedef struct {
 
     char *buffer;
     isize buffer_used;
+
+    StringView directory_path;
 } Server;
 
 void server_accept_clients(Server *server, SOCKET listen_socket) {
@@ -351,6 +362,8 @@ void server_broadcast(Server *server, StringView message) {
 }
 
 String server_http_response(Server *server, SOCKET client_socket, bool *upgraded_to_websocket) {
+    // Parse HTTP request
+
     HttpReader *reader = http_reader_create();
     server->buffer_used = 0;
 
@@ -373,6 +386,8 @@ String server_http_response(Server *server, SOCKET client_socket, bool *upgraded
         );
         server->buffer_used -= bytes_read;
     }
+
+    // Check if we received a WebSocket handshake, generate a handshake response, if so
 
     *upgraded_to_websocket = reader->is_websocket;
 
@@ -410,29 +425,57 @@ String server_http_response(Server *server, SOCKET client_socket, bool *upgraded
         return response;
     }
 
+    // Process a regular HTTP request otherwise
+
     String response = string_empty();
-    isize response_size = 0;
 
-    if (string_equals(reader->request_line.uri, SV("/"))) {
-        response = http_response_file(SV("index.html"));
-    }
+    // FIXME: Figure out a better allocation scheme and stop allocating randomly-sized buffers on
+    // the stack. This 1024 does not mean anything, I'm just too lazy to deal with malloc/free.
+    u8 path_buffer[1024] = {0};
+    isize path_size = uri_decode_path(
+        reader->request_line.uri,
+        path_buffer, sizeof(path_buffer) - 1
+    );
 
-    if (string_equals(reader->request_line.uri, SV("/hot-reload.js"))) {
-        char const code_format[] = SRC(
-            const socket = new WebSocket("ws://localhost:%s/");
-            socket.addEventListener("message", (event) => {
-                location.reload();
-            });
-        );
-        String code = {0};
-        string_append_format(&code, code_format, DEFAULT_PORT);
+    if (path_size > 0) {
+        StringView path = {(char const *)path_buffer, path_size};
 
-        response = http_response_string(
-            string_view(&code),
-            "application/javascript"
-        );
+        if (string_equals(path, SV("/hot-reload.js"))) {
+            char const code_format[] = SRC(
+                const socket = new WebSocket("ws://localhost:%s/");
+                socket.addEventListener("message", (event) => {
+                    location.reload();
+                });
+            );
 
-        string_destroy(&code);
+            String code = {0};
+            string_append_format(&code, code_format, DEFAULT_PORT);
+            response = http_response_string(string_view(&code), "application/javascript");
+            string_destroy(&code);
+        } else {
+            String file_path = {0};
+            string_append(&file_path, server->directory_path);
+
+            if (
+                !string_ends_with(string_view(&file_path), SV("/")) &&
+                !string_ends_with(string_view(&file_path), SV("\\"))
+            ) {
+                string_append(&file_path, SV("/"));
+            }
+
+            if (string_equals(path, SV("/"))) {
+                string_append(&file_path, SV("index.html"));
+            } else {
+                if (string_starts_with(path, SV("/"))) {
+                    path.data += 1;
+                    path.size -= 1;
+                }
+                string_append(&file_path, path);
+            }
+
+            response = http_response_file(string_view(&file_path));
+            string_destroy(&file_path);
+        }
     }
 
     if (response.size == 0) {
@@ -450,19 +493,37 @@ int wmain(int arg_count, WCHAR **args) {
         abort();
     }
 
-    WCHAR *directory_path = L"./";
+    WCHAR *directory_path_wide = L"./";
     if (arg_count > 1) {
-        directory_path = args[1];
+        directory_path_wide = args[1];
     }
+
+    // I use wmain, so that you could pass the directory path in Unicode, but as it turns out,
+    // fopen() does not work with UTF-8 encoded paths anyway, so as long as I'm using fopen(), this
+    // conversion does not help much in the Unicode support department.
+    char *directory_path_buffer = malloc(MAX_PATH * 4);
+    isize directory_path_size = WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        directory_path_wide, -1,
+        directory_path_buffer, MAX_PATH * 4,
+        NULL, NULL
+    );
+    if (directory_path_size == 0) {
+        return 1;
+    }
+    // Minus one because of the null-terminator.
+    StringView directory_path = {directory_path_buffer, directory_path_size - 1};
 
     Server server = {
         .events = malloc(MAX_SERVER_EVENTS * sizeof(HANDLE)),
         .event_sources = malloc(MAX_SERVER_EVENTS * sizeof(EventSource)),
         .buffer = malloc(IO_BUFFER_CAPACITY),
+        .directory_path = directory_path,
     };
 
     bool directory_notifier_created = event_source_directory_notifier(
-        directory_path,
+        directory_path_wide,
         &server.event_sources[0]
     );
     if (!directory_notifier_created) {

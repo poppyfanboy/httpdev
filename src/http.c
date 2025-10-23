@@ -339,3 +339,92 @@ isize http_reader_feed(HttpReader *reader, char const *data, isize data_size) {
 
     return data_iter - data;
 }
+
+bool char_is_hex(char value) {
+    return
+        '0' <= value && value <= '9' ||
+        'a' <= value && value <= 'f' ||
+        'A' <= value && value <= 'F';
+}
+
+u8 hex_digit_value(char hex) {
+    if ('0' <= hex && hex <= '9') {
+        return hex - '0';
+    }
+    if ('a' <= hex && hex <= 'f') {
+        return 10 + (hex - 'a');
+    }
+    if ('A' <= hex && hex <= 'F') {
+        return 10 + (hex - 'A');
+    }
+
+    return 0;
+}
+
+u8 hex_byte_value(char const *hex) {
+    u8 high = hex_digit_value(hex[0]);
+    u8 low  = hex_digit_value(hex[1]);
+
+    return high << 4 | low;
+}
+
+// Only checks if percent encoding is correct.
+bool uri_is_valid(StringView uri) {
+    char const *uri_iter = uri.data;
+    char const *uri_end = uri.data + uri.size;
+
+    while (uri_iter < uri_end) {
+        if (*uri_iter == '%') {
+            if (uri_end - uri_iter < 3) {
+                return false;
+            }
+            if (!char_is_hex(uri_iter[1]) || !char_is_hex(uri_iter[2])) {
+                return false;
+            }
+
+            uri_iter += 3;
+        } else {
+            uri_iter += 1;
+        }
+    }
+
+    return true;
+}
+
+// FIXME: "." and ".." segments are returned as is.
+// Browsers usually resolve relative paths themselves, but we can't rely on this.
+isize uri_decode_path(StringView uri, u8 *buffer, isize buffer_size) {
+    assert(buffer_size > 0);
+
+    if (!uri_is_valid(uri)) {
+        return -1;
+    }
+
+    u8 *buffer_iter = buffer;
+    u8 *buffer_end = buffer + buffer_size;
+
+    char const *uri_iter = uri.data;
+    char const *uri_end = uri.data + uri.size;
+
+    while (uri_iter < uri_end && buffer_iter < buffer_end) {
+        if (*uri_iter == '?' || *uri_iter == '#') {
+            break;
+        }
+
+        if (*uri_iter == '%') {
+            *buffer_iter = hex_byte_value(&uri_iter[1]);
+            uri_iter += 3;
+        } else {
+            *buffer_iter = *uri_iter;
+            uri_iter += 1;
+        }
+
+        buffer_iter += 1;
+    }
+
+    if (!(uri_iter == uri_end || *uri_iter == '?' || *uri_iter == '#')) {
+        return -1;
+    }
+
+    return buffer_iter - buffer;
+}
